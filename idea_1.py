@@ -107,7 +107,7 @@ def calculate_ade_fde(pred, gt):
 
 # --------------------- メイン ---------------------
 def main():
-    data_root = "/path/to/nuscenes_mini"  # ここは実際のパスに変更してください
+    data_root = "./data"  # または絶対パスを指定（例: /content/data）
     nusc = NuScenes(version='v1.0-mini', dataroot=data_root, verbose=False)
     trajectories_np = get_pedestrian_trajectories(nusc, max_timesteps=8)
     if len(trajectories_np) == 0:
