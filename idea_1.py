@@ -1,138 +1,275 @@
+
+from __future__ import annotations
+import os
+import math
+import random
+import argparse
+from typing import List, Dict, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from nuscenes.nuscenes import NuScenes
+from torch.utils.data import Dataset, DataLoader
 
-# --------------------- 環境特徴量抽出 ---------------------
-def extract_environment_features(lidar_points, trajectories):
-    B, N_ped, T, _ = trajectories.shape
-    static_density = torch.full((B, N_ped, 1), fill_value=lidar_points.size(1)/1000.0)
-    nearest_dist = torch.rand(B, N_ped, 1) * 10
-    pedestrian_density = torch.full((B, N_ped, 1), fill_value=N_ped/10.0)
-    interaction_strength = torch.rand(B, N_ped, 1)
-    return static_density, nearest_dist, pedestrian_density, interaction_strength
+# =============== ユーティリティ ===============
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-# --------------------- GATモジュール ---------------------
-class SimpleGATLayer(nn.Module):
-    def __init__(self, in_features, out_features):
+
+def pairwise_l2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """a: [N,2], b:[M,2] -> [N,M]"""
+    return torch.cdist(a, b, p=2)
+
+
+# =============== データ抽出 ===============
+class NuScenesPedSeqs(Dataset):
+    """nuScenes mini から歩行者の連続軌跡を切り出して学習用シーケンスを作る。
+    - 各インスタンス（歩行者）ごとに連続 T_obs + T_pred のウィンドウを抽出
+    - 位置はシーン座標 (x,y) [メートル]
+    - 返り値: past_abs [T_obs,2], future_abs [T_pred,2]
+    """
+    def __init__(self, dataroot: str, version: str = 'v1.0-mini', T_obs: int = 8, T_pred: int = 12,
+                 split: str = 'train', split_ratio: Tuple[float,float,float] = (0.7,0.15,0.15)):
         super().__init__()
-        self.fc = nn.Linear(in_features, out_features, bias=False)
-        self.attn_fc = nn.Linear(out_features*2, 1, bias=False)
-    def forward(self, h):
-        B, N, F_in = h.size()
-        Wh = self.fc(h)
-        Wh_repeat_i = Wh.unsqueeze(2).repeat(1,1,N,1)
-        Wh_repeat_j = Wh.unsqueeze(1).repeat(1,N,1,1)
-        e = self.attn_fc(torch.cat([Wh_repeat_i, Wh_repeat_j], dim=-1)).squeeze(-1)
-        alpha = F.softmax(F.leaky_relu(e), dim=-1)
-        h_prime = torch.bmm(alpha, Wh)
-        return h_prime
+        from nuscenes.nuscenes import NuScenes
+        self.T_obs = T_obs
+        self.T_pred = T_pred
+        self.T_total = T_obs + T_pred
+        self.samples: List[Tuple[np.ndarray, np.ndarray]] = []
 
-# --------------------- Beam Model ---------------------
-class BeamModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
+        nusc = NuScenes(version=version, dataroot=dataroot, verbose=False)
+
+        # 全シーンを時系列で走査し、歩行者 instance ごとの連続位置列を作る
+        all_trajs: List[np.ndarray] = []  # [L,2]
+        for scene in nusc.scene:
+            token = scene['first_sample_token']
+            # instance_token -> list of positions
+            tracks: Dict[str, List[List[float]]] = {}
+            timestamps: Dict[str, List[int]] = {}
+            while token:
+                sample = nusc.get('sample', token)
+                next_token = sample['next']
+                for ann_token in sample['anns']:
+                    ann = nusc.get('sample_annotation', ann_token)
+                    cat = ann['category_name']
+                    if not cat.startswith('human.pedestrian'):
+                        continue
+                    iid = ann['instance_token']
+                    pos = ann['translation'][:2]  # [x,y]
+                    if iid not in tracks:
+                        tracks[iid] = []
+                        timestamps[iid] = []
+                    tracks[iid].append(pos)
+                    timestamps[iid].append(sample['timestamp'])
+                token = next_token
+                if token == '':
+                    break
+            # 連続なフレームのみ抽出（タイムスタンプの欠落を除外）
+            for iid, xy_list in tracks.items():
+                ts = np.array(timestamps[iid])
+                xy = np.array(xy_list, dtype=np.float32)
+                # 欠損で飛んでいる箇所で切る
+                if len(ts) < self.T_total:
+                    continue
+                # だいたい 0.5s (2Hz) 間隔。差が一定かどうかで連続区間を検出
+                dt = np.diff(ts)
+                # 許容: モードの±10% 以内
+                if len(dt) == 0:
+                    continue
+                mode_dt = np.bincount((dt // 1e5).astype(int)).argmax() * 1e5
+                breaks = np.where(np.abs(dt - mode_dt) > 0.2 * mode_dt)[0]
+                start = 0
+                breaks = list(breaks) + [len(xy) - 1]
+                for br in breaks:
+                    end = br + 1
+                    seg = xy[start:end]
+                    if len(seg) >= self.T_total:
+                        all_trajs.append(seg)
+                    start = end
+        # ウィンドウスライス
+        windows: List[Tuple[np.ndarray, np.ndarray]] = []
+        for traj in all_trajs:
+            L = len(traj)
+            for s in range(0, L - self.T_total + 1):
+                past = traj[s : s + self.T_obs]
+                future = traj[s + self.T_obs : s + self.T_total]
+                windows.append((past, future))
+        # シャッフル & スプリット
+        rng = np.random.RandomState(42)
+        idx = np.arange(len(windows))
+        rng.shuffle(idx)
+        n = len(idx)
+        n_train = int(n * split_ratio[0])
+        n_val = int(n * split_ratio[1])
+        if split == 'train':
+            sel = idx[:n_train]
+        elif split == 'val':
+            sel = idx[n_train:n_train + n_val]
+        else:
+            sel = idx[n_train + n_val:]
+        self.samples = [windows[i] for i in sel]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i: int):
+        past_abs, future_abs = self.samples[i]
+        # 原点を観測開始点に合わせた相対座標も計算
+        origin = past_abs[0]
+        past_rel = past_abs - origin
+        future_rel = future_abs - origin
+        return {
+            'past_abs': torch.from_numpy(past_abs).float(),      # [T_obs,2]
+            'future_abs': torch.from_numpy(future_abs).float(),  # [T_pred,2]
+            'past_rel': torch.from_numpy(past_rel).float(),
+            'future_rel': torch.from_numpy(future_rel).float(),
+            'origin': torch.from_numpy(origin).float(),
+        }
+
+
+# =============== モデル ===============
+class TrajLSTM(nn.Module):
+    """Encoder-Decoder LSTM（相対変位をオートレグレッシブに予測）"""
+    def __init__(self, d_model: int = 128, num_layers: int = 2):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 2)
-        )
-    def forward(self, features):
-        return self.fc(features)
+        self.enc = nn.LSTM(input_size=2, hidden_size=d_model, num_layers=num_layers, batch_first=True)
+        self.dec = nn.LSTM(input_size=2, hidden_size=d_model, num_layers=num_layers, batch_first=True)
+        self.out = nn.Linear(d_model, 2)
 
-# --------------------- 環境適応型LSTM ---------------------
-class EnvAdaptiveLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim=2):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-    def forward(self, x):
-        _, (hn, _) = self.lstm(x)
-        out = self.fc(hn[-1])
-        return out
+    def forward(self, past_rel: torch.Tensor, T_pred: int, teacher_forcing: bool = True, future_rel: torch.Tensor | None = None):
+        """
+        past_rel: [B, T_obs, 2]
+        future_rel: [B, T_pred, 2] (教師強制用)
+        return: future_rel_pred [B,T_pred,2]
+        """
+        B = past_rel.size(0)
+        enc_out, (h, c) = self.enc(past_rel)
+        # デコーダ初期入力は最後の相対ステップ（またはゼロ）
+        y = past_rel[:, -1, :].unsqueeze(1)  # [B,1,2]
+        preds = []
+        for t in range(T_pred):
+            dec_out, (h, c) = self.dec(y, (h, c))
+            step = self.out(dec_out)  # [B,1,2] 相対変位（次ステップとの差分）
+            preds.append(step)
+            if teacher_forcing and future_rel is not None:
+                y = future_rel[:, t:t+1, :]
+            else:
+                y = step
+        return torch.cat(preds, dim=1)
 
-# --------------------- 統合モデル ---------------------
-class TrajectoryPredictor(nn.Module):
-    def __init__(self, gat_in_dim, gat_out_dim, beam_in_dim, beam_hidden_dim, lstm_input_dim, lstm_hidden_dim):
-        super().__init__()
-        self.gat = SimpleGATLayer(gat_in_dim, gat_out_dim)
-        self.beam = BeamModel(beam_in_dim, beam_hidden_dim)
-        self.env_lstm = EnvAdaptiveLSTM(lstm_input_dim, lstm_hidden_dim)
-    def forward(self, traj_hist, env_feats):
-        B, N, T, _ = traj_hist.shape
-        gat_input = traj_hist[:, :, -1, :]
-        gat_out = self.gat(gat_input)
-        beam_out = self.beam(env_feats)
-        first_pred = gat_out[:, :, :2] + beam_out
-        pred_confidence = torch.sigmoid(-torch.norm(beam_out, dim=-1, keepdim=True))
-        correction_needed = (pred_confidence < 0.5).float()
-        lstm_in = torch.cat([traj_hist.reshape(B*N, T, 2), env_feats.unsqueeze(2).repeat(1,1,T,1).reshape(B*N, T, -1)], dim=-1)
-        correction = self.env_lstm(lstm_in).view(B, N, 2)
-        final_pred = first_pred + correction * correction_needed
-        return final_pred, pred_confidence.squeeze(-1)
 
-# --------------------- nuScenes_miniから歩行者軌跡抽出 ---------------------
-def get_pedestrian_trajectories(nusc, max_timesteps=8):
-    trajectories = []
-    for scene in nusc.scene:
-        first_sample_token = scene['first_sample_token']
-        sample_token = first_sample_token
-        ped_positions = dict()
-        for _ in range(max_timesteps):
-            sample = nusc.get('sample', sample_token)
-            sample_token = sample['next']
-            if sample_token == '':
-                break
-            for ann_token in sample['anns']:
-                ann = nusc.get('sample_annotation', ann_token)
-                if ann['category_name'] == 'human.pedestrian.adult':
-                    ped_token = ann['instance_token']
-                    pos = ann['translation'][:2]
-                    if ped_token not in ped_positions:
-                        ped_positions[ped_token] = []
-                    ped_positions[ped_token].append(pos)
-        for traj in ped_positions.values():
-            if len(traj) == max_timesteps:
-                trajectories.append(traj)
-    return np.array(trajectories)
+# =============== 評価指標 ===============
+@torch.no_grad()
+def compute_metrics(future_abs_pred: torch.Tensor, future_abs_gt: torch.Tensor) -> Dict[str, float]:
+    """future_abs_*: [B,T_pred,2]"""
+    diff = future_abs_pred - future_abs_gt
+    dist = diff.norm(dim=-1)  # [B,T]
+    ade = dist.mean().item()
+    fde = dist[:, -1].mean().item()
+    mr2 = (dist[:, -1] > 2.0).float().mean().item()
+    return {'ADE': ade, 'FDE': fde, 'MR@2m': mr2}
 
-# --------------------- ADE/FDE計算 ---------------------
-def calculate_ade_fde(pred, gt):
-    diff = pred - gt
-    dist = torch.norm(diff, dim=-1)
-    ade = dist.mean(dim=-1).mean().item()
-    fde = dist[:, :, -1].mean(dim=-1).item()
-    return ade, fde
 
-# --------------------- メイン ---------------------
-def main():
-    data_root = "./data"  # または絶対パスを指定（例: /content/data）
-    nusc = NuScenes(version='v1.0-mini', dataroot=data_root, verbose=False)
-    trajectories_np = get_pedestrian_trajectories(nusc, max_timesteps=8)
-    if len(trajectories_np) == 0:
-        print("歩行者軌跡が取得できませんでした")
-        return
-    print(f"抽出された軌跡数: {len(trajectories_np)}")
-    B = 1
-    N_ped, T, _ = trajectories_np.shape
-    lidar_points = torch.randn(B, 1000, 3)
-    trajectories = torch.tensor(trajectories_np, dtype=torch.float32).unsqueeze(0)
-    static_density, nearest_dist, pedestrian_density, interaction_strength = extract_environment_features(lidar_points, trajectories)
-    env_feats = torch.cat([static_density, nearest_dist, pedestrian_density, interaction_strength], dim=-1)
-    model = TrajectoryPredictor(
-        gat_in_dim=2, gat_out_dim=4,
-        beam_in_dim=4, beam_hidden_dim=16,
-        lstm_input_dim=2+4, lstm_hidden_dim=32
-    )
+# =============== 学習ループ ===============
+def train_one_epoch(model, loader, opt, device, T_pred, clip=1.0):
+    model.train()
+    total_loss = 0.0
+    crit = nn.L1Loss()  # L1 は外れ値にややロバスト
+    for batch in loader:
+        past_rel = batch['past_rel'].to(device)
+        future_rel = batch['future_rel'].to(device)
+        origin = batch['origin'].to(device)
+        past_abs = batch['past_abs'].to(device)
+        future_abs = batch['future_abs'].to(device)
+
+        opt.zero_grad()
+        pred_rel = model(past_rel, T_pred=T_pred, teacher_forcing=True, future_rel=future_rel)
+        # 相対 → 絶対（原点 + 累積和）
+        pred_abs = origin.unsqueeze(1) + torch.cumsum(pred_rel, dim=1)
+        loss = crit(pred_abs, future_abs)
+        loss.backward()
+        if clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        opt.step()
+        total_loss += loss.item() * past_rel.size(0)
+    return total_loss / len(loader.dataset)
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, T_pred):
     model.eval()
-    with torch.no_grad():
-        pred_traj, pred_conf = model(trajectories, env_feats)
-    # ここでは単ステップ予測のため、GTの次時刻を使ってADE,FDE計算
-    gt_next_pos = trajectories[:, :, -1, :]
-    ade = torch.norm(pred_traj.squeeze(0) - gt_next_pos.squeeze(0), dim=-1).mean().item()
-    fde = ade  # 単ステップなら同じ
-    print(f"ADE (1-step): {ade:.4f}, FDE (1-step): {fde:.4f}")
+    total = 0
+    mets = {'ADE': 0.0, 'FDE': 0.0, 'MR@2m': 0.0}
+    for batch in loader:
+        past_rel = batch['past_rel'].to(device)
+        future_rel = batch['future_rel'].to(device)
+        origin = batch['origin'].to(device)
+        future_abs = batch['future_abs'].to(device)
+        pred_rel = model(past_rel, T_pred=T_pred, teacher_forcing=False)
+        pred_abs = origin.unsqueeze(1) + torch.cumsum(pred_rel, dim=1)
+        m = compute_metrics(pred_abs, future_abs)
+        bs = past_rel.size(0)
+        for k in mets:
+            mets[k] += m[k] * bs
+        total += bs
+    for k in mets:
+        mets[k] /= total
+    return mets
 
-if __name__ == "__main__":
+
+# =============== メイン ===============
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataroot', type=str, default='./data')
+    parser.add_argument('--version', type=str, default='v1.0-mini')
+    parser.add_argument('--obs', type=int, default=8)
+    parser.add_argument('--pred', type=int, default=12)
+    parser.add_argument('--batch', type=int, default=64)
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--save', type=str, default='./checkpoint_lstm.pt')
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # データセット
+    train_ds = NuScenesPedSeqs(args.dataroot, args.version, args.obs, args.pred, 'train')
+    val_ds = NuScenesPedSeqs(args.dataroot, args.version, args.obs, args.pred, 'val')
+    test_ds = NuScenesPedSeqs(args.dataroot, args.version, args.obs, args.pred, 'test')
+
+    if len(train_ds) == 0:
+        print('データが見つかりません。--dataroot と nuScenes mini の配置を確認してください。')
+        return
+
+    train_ld = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=2, drop_last=False)
+    val_ld = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=2)
+    test_ld = DataLoader(test_ds, batch_size=args.batch, shuffle=False, num_workers=2)
+
+    # モデル
+    model = TrajLSTM(d_model=128, num_layers=2).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_val = math.inf
+    for ep in range(1, args.epochs + 1):
+        tr_loss = train_one_epoch(model, train_ld, opt, device, T_pred=args.pred)
+        val_m = evaluate(model, val_ld, device, T_pred=args.pred)
+        print(f"[Epoch {ep:02d}] train L1: {tr_loss:.4f} | val ADE: {val_m['ADE']:.3f} FDE: {val_m['FDE']:.3f} MR@2m: {val_m['MR@2m']:.3f}")
+        if val_m['ADE'] < best_val:
+            best_val = val_m['ADE']
+            torch.save({'model': model.state_dict(), 'args': vars(args)}, args.save)
+            print(f"  -> checkpoint saved to {args.save}")
+
+    # テスト評価
+    ckpt = torch.load(args.save, map_location=device)
+    model.load_state_dict(ckpt['model'])
+    test_m = evaluate(model, test_ld, device, T_pred=args.pred)
+    print(f"[Test] ADE: {test_m['ADE']:.3f} FDE: {test_m['FDE']:.3f} MR@2m: {test_m['MR@2m']:.3f}")
+
+
+if __name__ == '__main__':
     main()
